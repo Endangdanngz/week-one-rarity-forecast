@@ -26,10 +26,12 @@ Three parts:
 
 Cases are cut from the simulated recordings at several checkpoints and
 horizons, every forecaster is scored on each, and the table at the end
-compares the model against both baselines cell by cell. The model must beat
-both baselines overall and stay competitive in every cell before its CONFIG
-is accepted; the final-like cells (day-2 checkpoint, 4.52-day horizon) carry
-the most weight because the real final has that shape.
+compares the model against both baselines cell by cell and reports the
+model's 90% coverage (share of answers inside [q05, q95]) per cell. The
+model must beat both baselines overall and stay competitive in every cell
+before its CONFIG is accepted; the final-like cells (day-2 checkpoint,
+4.52-day horizon) carry the most weight because the real final has that
+shape.
 
 Usage: python3 backtest.py [--seeds N] [--sweep]
 """
@@ -87,6 +89,19 @@ def pinball_loss(rows, answer):
 
 def rows_of(forecast):
     return {row["id"]: row["q"] for row in forecast["trophies"]}
+
+
+def coverage90(rows, answer):
+    """Share of scored trophies whose answer rate lies inside [q05, q95]."""
+    inside = 0
+    total = 0
+    for tid, qs in rows.items():
+        if tid not in answer or answer[tid] is None:
+            continue
+        total += 1
+        if qs[0] <= answer[tid] <= qs[-1]:
+            inside += 1
+    return inside / total if total else float("nan")
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +323,7 @@ def run_suite(seeds):
     results = {}
     for name, regime, cp_days, horizon in CELLS:
         sums = {"model": 0.0, "persistence": 0.0, "curve": 0.0}
+        cov_sum = 0.0
         used = 0
         for seed in seeds:
             reads = simulate(trophies_meta, seed * 1000 + zlib.crc32(name.encode()) % 997, regime)
@@ -315,27 +331,33 @@ def run_suite(seeds):
             case, answer = cut_case(reads, trophies_meta, name, checkpoint, horizon)
             if answer is None or not case["history"]:
                 continue
-            sums["model"] += pinball_loss(model_rows(case), answer)
+            mrows = model_rows(case)
+            sums["model"] += pinball_loss(mrows, answer)
             sums["persistence"] += pinball_loss(persistence_rows(case), answer)
             sums["curve"] += pinball_loss(curve_rows(case), answer)
+            cov_sum += coverage90(mrows, answer)
             used += 1
         if used:
             results[name] = {k: v / used for k, v in sums.items()}
+            results[name]["coverage"] = cov_sum / used
     return results
 
 
 def print_table(results):
-    print(f"{'cell':<22} {'model':>8} {'persist':>8} {'curve':>8}  verdict")
+    print(f"{'cell':<22} {'model':>8} {'persist':>8} {'curve':>8} {'cov90':>6}  verdict")
     tot = {"model": 0.0, "persistence": 0.0, "curve": 0.0}
+    cov_tot = 0.0
     for name, r in results.items():
         best_base = min(r["persistence"], r["curve"])
         verdict = "WIN " if r["model"] < best_base else "lose"
-        print(f"{name:<22} {r['model']:>8.4f} {r['persistence']:>8.4f} {r['curve']:>8.4f}  {verdict}")
+        print(f"{name:<22} {r['model']:>8.4f} {r['persistence']:>8.4f} {r['curve']:>8.4f} "
+              f"{r.get('coverage', float('nan')):>6.3f}  {verdict}")
         for k in tot:
             tot[k] += r[k]
+        cov_tot += r.get("coverage", 0.0)
     n = max(len(results), 1)
     print(f"{'OVERALL (mean)':<22} {tot['model']/n:>8.4f} {tot['persistence']/n:>8.4f} "
-          f"{tot['curve']/n:>8.4f}")
+          f"{tot['curve']/n:>8.4f} {cov_tot/n:>6.3f}")
 
 
 def sweep(seeds):

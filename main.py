@@ -26,11 +26,22 @@ read in logit space:
   (story / side / collectibles / stunts / completion / ultra-hard), then
   damped over the forecast horizon and capped, so a hot launch slope is never
   extrapolated linearly for four and a half days.
+* Earners/players decomposition (rich histories, three or more segments):
+  the rate is rebuilt from its two moving parts. New tracked players earn
+  each trophy at a marginal share estimated from the segment pairs (shrunk
+  toward the group median), the already-tracked base keeps earning it at a
+  per-day progression rate estimated from the pairs' residual (decayed over
+  the horizon, since players finish content), and the player base itself is
+  projected with the saturating log-log fit below, never downward and never
+  past a capped multiple of the last count. The resulting median is blended
+  with the drift median in logit space, the decomposition weighted higher
+  the more segments and the cleaner the players fit; at horizon zero it
+  reproduces the last read exactly, by construction.
 * Denominator growth: a log-log fit of players-tracked against hours since
   release projects how much the player base grows by the target. In the
-  normal branch the observed drifts already contain the dilution that growth
-  causes, so the projection is used only for spread sizing and for the
-  special branch below.
+  drift view the observed drifts already contain the dilution that growth
+  causes, so there the projection is used only for spread sizing and for
+  the special branch below; the decomposition uses it directly.
 * Frozen-page branch: if the whole history is a single state, no refresh has
   been observed yet and the dominant event inside the horizon is the first
   refresh itself: a small launch-night denominator can multiply several-fold
@@ -39,9 +50,14 @@ read in logit space:
   a wide, downward-skewed spread.
 * Spread: a random-walk term in sqrt(horizon), plus the observed per-refresh
   jump variance times the expected number of refreshes in the horizon, plus
-  inflation for thin data, stale pages and extreme rates. The two tails use
-  different sigmas: the downside widens when dilution dominates, the upside
-  when a trophy is rising fast.
+  inflation for thin data, stale pages and extreme rates, plus a term for
+  the disagreement between the drift and decomposition medians. The jump
+  variance is estimated on recent transitions only (launch-sized jumps say
+  little about the jump scale days later), and a young page with a handful
+  of states keeps a sigma floor that decays over its first hours, when the
+  earn curves are steepest and two page states cannot measure them. The two
+  tails use different sigmas: the downside widens when dilution dominates,
+  the upside when a trophy is rising fast.
 
 Guards: rates are clamped to [0.01, 99.99] before any logit, logits are
 clamped to [-10, 10], the median shift is capped, a 100% rate is never pinned
@@ -88,17 +104,42 @@ CONFIG = {
     "drift_halflife_days": 1.25,  # recency weighting of segment transitions
     "slope_halflife_days": 0.55,  # recency weighting of the log-time slope fit
     # Spread, normal branch (logit units).
-    "rw_sigma": 0.44,           # random-walk sigma per sqrt(day)
+    "rw_sigma": 0.40,           # random-walk sigma per sqrt(day)
     "jump_w": 0.5,              # weight of observed per-refresh jump variance
     "jump_shrink": 6.0,         # pseudo-count shrinking jump var to pooled
+    "jump_halflife_days": 0.6,  # jump variance is estimated on recent
+                                # transitions only: launch-sized jumps say
+                                # little about the jump scale days later
     "thin_sigma": 0.30,         # added sigma when a trophy has no transitions
-    "sigma_scale": 0.85,        # global multiplier on the normal-branch sigma
+    "sigma_scale": 0.80,        # global multiplier on the normal-branch sigma
     "sigma_min": 0.15,
     "sigma_max": 2.4,
     "max_refreshes": 5.0,       # cap on expected refreshes inside horizon
     # Tail asymmetry (normal branch).
     "asym_down": 1.25,          # sigma_down multiplier when drift < 0
     "asym_up": 1.20,            # sigma_up multiplier when drift is strongly > 0
+    # Earners/players decomposition (normal branch, >= dec_min_segments).
+    "dec_min_segments": 3,
+    "dec_w_base": 0.30,         # blend weight on the decomposition median
+    "dec_w_per_seg": 0.055,     #   plus this per segment past the minimum
+    "dec_w_max": 0.70,
+    "dec_m_halflife_days": 1.25,  # recency weighting of segment pairs
+    "dec_m_shrink": 1.5,        # pseudo-pairs shrinking m to the group median
+    "dec_g_shrink": 1.5,        # pseudo-pairs shrinking progression likewise
+    "dec_g_max": 0.45,          # cap on progression, per day (earners growth)
+    "dec_prog_tau_days": 2.5,   # progression decays over the horizon on this scale
+    "dec_players_cap": 3.0,     # players at target <= cap x last count ...
+    "dec_players_cap_hi": 4.0,  # ... unless the log-log fit is steep and clean
+    "dec_disagree_w": 0.22,     # sigma added per logit of median disagreement
+    # Young-page sigma floor: with a handful of page states in the first
+    # hours after release the earn curves are on their steepest segment and
+    # two states cannot measure that, so the spread keeps a floor that
+    # decays as the page ages (binds only when the computed sigma is lower).
+    "young_floor_c0": 1.05,     # floor at release hour 0, logit units
+    "young_floor_c1": 0.045,    # floor decay per hour since release
+    "young_floor_min": 0.45,
+    "young_floor_hours": 18.0,  # floor applies only before this page age
+    "young_floor_segs": 3,      # ... and only with at most this many segments
     # Frozen-page (single-state history) branch.
     "flat_fp_c0": 0.55,         # median ln(players factor) =
     "flat_fp_c1": 0.55,         #   c0 + c1*ln(1+horizon_hours)
@@ -211,12 +252,13 @@ def classify_trophy(trophy):
 # --------------------------------------------------------------------------
 
 class Segment:
-    __slots__ = ("t", "players", "rates")
+    __slots__ = ("t", "players", "rates", "te")
 
-    def __init__(self, t, players, rates):
+    def __init__(self, t, players, rates, te=None):
         self.t = t                # epoch seconds of the first read with this state
         self.players = players    # players tracked (float) or None
         self.rates = rates        # tuple of rates (float or None), trophy order
+        self.te = te              # page's total trophies-earned count, or None
 
 
 def build_segments(history, n_trophies):
@@ -244,19 +286,40 @@ def build_segments(history, n_trophies):
             players = float(players) if players is not None else None
         except (TypeError, ValueError):
             players = None
-        reads.append((t, players, tuple(rates)))
+        te = read.get("trophies_earned")
+        try:
+            te = float(te) if te is not None else None
+        except (TypeError, ValueError):
+            te = None
+        reads.append((t, players, tuple(rates), te))
     reads.sort(key=lambda r: r[0])
     segments = []
     last_players = None
-    for t, players, rates in reads:
+    for t, players, rates, te in reads:
         if players is None:
             players = last_players
         else:
             last_players = players
         if segments and segments[-1].players == players and segments[-1].rates == rates:
             continue  # same page state as the previous read: not a refresh
-        segments.append(Segment(t, players, rates))
+        segments.append(Segment(t, players, rates, te))
     return segments, reads
+
+
+def implied_players(seg):
+    """Players tracked for a segment, with a trophies_earned fallback.
+
+    The page prints both the player count and the total trophies earned by
+    those players; the second is the sum over trophies of earners, so when
+    the player count itself is missing the ratio of the two recovers it.
+    """
+    if seg.players and seg.players > 0:
+        return seg.players
+    if seg.te:
+        total_rate = sum(r for r in seg.rates if r is not None)
+        if total_rate > 0:
+            return seg.te / (total_rate / 100.0)
+    return seg.players
 
 
 def carried_rates(segments, n_trophies):
@@ -341,8 +404,9 @@ def trophy_drifts(segments, carried, groups, cfg):
                 w = math.sqrt(max(dt_days, 0.02)) * 0.5 ** (age_days / cfg["drift_halflife_days"])
                 num += w * (djump / dt_days)
                 den += w
-                jump_num[i] += w * djump * djump
-                jump_den[i] += w
+                w_jump = math.sqrt(max(dt_days, 0.02)) * 0.5 ** (age_days / cfg["jump_halflife_days"])
+                jump_num[i] += w_jump * djump * djump
+                jump_den[i] += w_jump
                 n_trans[i] += 1
             if den > 0:
                 drift[i] = num / den
@@ -432,6 +496,202 @@ def logtime_slopes(segments, carried, groups, release_ts, hours_target, cfg):
             mx, my = center[i]
             preds.append(clamp(my + s * (x_target - mx), -10.0, 10.0))
     return out, preds
+
+
+# --------------------------------------------------------------------------
+# Earners/players decomposition (rich histories)
+# --------------------------------------------------------------------------
+
+def fit_series(xs, ys):
+    """Least squares y ~ x. Returns (slope, intercept, residual std) or None."""
+    n = len(xs)
+    if n < 2:
+        return None
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx <= 1e-12:
+        return None
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    intercept = my - slope * mx
+    resid = math.sqrt(sum((y - (intercept + slope * x)) ** 2 for x, y in zip(xs, ys)) / n)
+    return slope, intercept, resid
+
+
+def decomposition_forecast(segments, groups, release_ts, hours_target,
+                           horizon_days, cfg):
+    """Rebuild each rate from earners and players, separately forecast.
+
+    For every trophy, the observed segment pairs give two quantities:
+
+    * the marginal earn share m: of the players who joined the tracked base
+      between two page states, the share who already hold the trophy. It is
+      recency-weighted, clipped to [0, 1.2] pair by pair, and shrunk toward
+      the group median - new players are systematically less far along than
+      the base they join, so m sits below the trophy's current rate share
+      for anything but the opening trophies.
+    * the progression rate g: the per-day growth of earners among the base
+      that was already tracked, taken as the pairs' residual earners growth
+      once the newcomers' contribution m*dP is removed, likewise shrunk.
+
+    The player base at the target comes from the saturating log-log fit of
+    ln(players) on ln(1 + hours since release): never below the last count,
+    never above a capped multiple of it (a higher cap only when the fit is
+    steep and clean). Earners at the target are then
+
+        E_last + m * (P_target - P_at_E_last)
+               + E_last * (exp(g * eff_days) - 1),
+
+    with eff_days the horizon discounted on the progression decay scale
+    (players finish content, so the base's earning slows), floored at
+    0.98 * E_last (earners essentially never shrink; the hair allows for
+    tracker churn) and capped at P_target. At horizon zero P_target is the
+    last count and eff_days is zero, so the decomposition returns the last
+    read's rate exactly.
+
+    Returns (dec_logit, dec_weight, p_target): per-trophy median logits and
+    blend weights (None where a trophy has no usable observation), or None
+    when the history is too thin or the players series is unusable.
+    """
+    n = len(groups)
+    n_seg = len(segments)
+    if n_seg < cfg["dec_min_segments"] or not release_ts:
+        return None
+    players = [implied_players(seg) for seg in segments]
+    pts = [(math.log1p(max((seg.t - release_ts) / 3600.0, -0.9)), math.log(p))
+           for seg, p in zip(segments, players) if p and p > 0]
+    if len(pts) < cfg["dec_min_segments"]:
+        return None
+    fit = fit_series([p[0] for p in pts], [p[1] for p in pts])
+    if fit is None:
+        return None
+    slope, intercept, resid = fit
+    p_last = None
+    for p in reversed(players):
+        if p and p > 0:
+            p_last = p
+            break
+    if p_last is None:
+        return None
+    cap = cfg["dec_players_cap"]
+    if slope > 1.6 and resid < 0.25 and len(pts) >= 5:
+        cap = cfg["dec_players_cap_hi"]
+    ln_pt = intercept + slope * math.log1p(max(hours_target, -0.9))
+    p_target = clamp(math.exp(clamp(ln_pt, -5.0, 20.0)), p_last, p_last * cap)
+    capped = ln_pt > math.log(p_last * cap)
+    t_last = segments[-1].t
+    half = cfg["dec_m_halflife_days"]
+
+    # Observations per trophy: (segment index, earners, players) wherever the
+    # read actually listed the trophy (carried rates would fake earners that
+    # grow exactly with the player base).
+    obs = []
+    for i in range(n):
+        rows = []
+        for s, seg in enumerate(segments):
+            if seg.rates[i] is not None and players[s] and players[s] > 0:
+                rows.append((s, seg.rates[i] / 100.0 * players[s], players[s]))
+        obs.append(rows)
+
+    # Pass 1: raw marginal share per trophy from consecutive observations.
+    m_raw = [None] * n
+    m_pairs = [0] * n
+    for i in range(n):
+        num = 0.0
+        den = 0.0
+        for (sa, ea, pa), (sb, eb, pb) in zip(obs[i], obs[i][1:]):
+            dp = pb - pa
+            if dp <= 0.01 * pa:
+                continue
+            age = (t_last - 0.5 * (segments[sa].t + segments[sb].t)) / 86400.0
+            w = dp * 0.5 ** (age / half)
+            num += w * clamp((eb - ea) / dp, 0.0, 1.2)
+            den += w
+            m_pairs[i] += 1
+        if den > 0:
+            m_raw[i] = num / den
+    by_group = {}
+    for i in range(n):
+        if m_raw[i] is not None:
+            by_group.setdefault(groups[i], []).append(m_raw[i])
+    group_m = {g: median_of(v) for g, v in by_group.items()}
+    all_m = median_of([v for v in m_raw if v is not None])
+    m_shrunk = [0.0] * n
+    for i in range(n):
+        g = group_m.get(groups[i], all_m)
+        if g is None:
+            m_shrunk[i] = m_raw[i] or 0.0
+        elif m_raw[i] is None:
+            m_shrunk[i] = g
+        else:
+            k = cfg["dec_m_shrink"]
+            m_shrunk[i] = (m_pairs[i] * m_raw[i] + k * g) / (m_pairs[i] + k)
+        m_shrunk[i] = clamp(m_shrunk[i], 0.0, 1.2)
+
+    # Pass 2: progression - residual earners growth per day on the old base.
+    g_raw = [None] * n
+    g_pairs = [0] * n
+    for i in range(n):
+        num = 0.0
+        den = 0.0
+        for (sa, ea, pa), (sb, eb, pb) in zip(obs[i], obs[i][1:]):
+            dt_days = (segments[sb].t - segments[sa].t) / 86400.0
+            e_mid = 0.5 * (ea + eb)
+            if dt_days <= 0.01 or e_mid < 1.0:
+                continue
+            resid_e = (eb - ea) - m_shrunk[i] * (pb - pa)
+            age = (t_last - 0.5 * (segments[sa].t + segments[sb].t)) / 86400.0
+            w = (0.5 ** (age / half)) * min(1.0, e_mid / 20.0 + 0.1)
+            num += w * clamp(resid_e / (e_mid * dt_days), -0.05, 0.8)
+            den += w
+            g_pairs[i] += 1
+        if den > 0:
+            g_raw[i] = num / den
+    by_group = {}
+    for i in range(n):
+        if g_raw[i] is not None:
+            by_group.setdefault(groups[i], []).append(g_raw[i])
+    group_g = {g: median_of(v) for g, v in by_group.items()}
+    all_g = median_of([v for v in g_raw if v is not None])
+
+    tau = cfg["dec_prog_tau_days"]
+    eff_days = tau * (1.0 - math.exp(-horizon_days / tau)) if horizon_days > 0 else 0.0
+    w_base = clamp(cfg["dec_w_base"] + cfg["dec_w_per_seg"] * (n_seg - cfg["dec_min_segments"]),
+                   0.0, cfg["dec_w_max"])
+    if resid > 0.30:
+        w_base *= 0.65
+    if capped:
+        w_base *= 0.85
+
+    dec_logit = [None] * n
+    dec_weight = [None] * n
+    for i in range(n):
+        if not obs[i]:
+            continue
+        _s_last, e_last, p_at_e = obs[i][-1]
+        g = group_g.get(groups[i], all_g)
+        if g_raw[i] is None and g is None:
+            prog = 0.0
+        else:
+            if g_raw[i] is None:
+                prog = g
+            elif g is None:
+                prog = g_raw[i]
+            else:
+                k = cfg["dec_g_shrink"]
+                prog = (g_pairs[i] * g_raw[i] + k * g) / (g_pairs[i] + k)
+            prog = clamp(prog, -0.02, cfg["dec_g_max"])
+        e_target = e_last + m_shrunk[i] * (p_target - p_at_e) \
+            + e_last * (math.exp(prog * eff_days) - 1.0)
+        e_target = min(max(e_target, 0.98 * e_last), p_target)
+        dec_logit[i] = logit_pct(100.0 * e_target / p_target)
+        w = w_base
+        if m_pairs[i] + g_pairs[i] < 2:
+            w *= 0.55
+        if len(obs[i]) < 2:
+            w *= 0.5
+        dec_weight[i] = w
+    return dec_logit, dec_weight, p_target
 
 
 # --------------------------------------------------------------------------
@@ -543,7 +803,7 @@ def forecast_case(case):
     carried = carried_rates(segments, n)
     last_rate = [carried[i][-1] for i in range(n)]
     last_seg = segments[-1]
-    last_players = last_seg.players
+    last_players = implied_players(last_seg)
     hours_cp = ((checkpoint - release_ts) / 3600.0) if (checkpoint is not None and release_ts) else 0.0
     hours_target = ((target_ts - release_ts) / 3600.0) if (target_ts is not None and release_ts) else hours_cp + horizon_hours
 
@@ -568,6 +828,8 @@ def forecast_case(case):
     slopes, line_preds = logtime_slopes(segments, carried, groups, release_ts, hours_target, cfg)
     fit = fit_players(segments, release_ts)
     proj_players = project_players(fit, last_players, hours_target)
+    dec = decomposition_forecast(segments, groups, release_ts, hours_target,
+                                 horizon_days, cfg)
 
     span_days = max((segments[-1].t - segments[0].t) / 86400.0, 0.02)
     refresh_per_day = len(segments) / span_days
@@ -605,16 +867,30 @@ def forecast_case(case):
             # the anchored median so a wild line cannot take over.
             line = clamp(line_preds[i], med_logit - 1.2, med_logit + 1.2)
             med_logit = clamp(0.55 * med_logit + 0.45 * line, -10.0, 10.0)
+        disagree = 0.0
+        if dec is not None and dec[0][i] is not None:
+            # Blend the decomposition median in logit space; the two views
+            # disagreeing is itself uncertainty, priced into the spread.
+            w_dec = dec[1][i]
+            disagree = abs(dec[0][i] - med_logit)
+            med_logit = clamp(w_dec * dec[0][i] + (1.0 - w_dec) * med_logit,
+                              base_logit - 3.4, base_logit + 3.4)
         medians[i] = med_logit
         var = (cfg["rw_sigma"] ** 2) * horizon_days \
             + cfg["jump_w"] * jump_var[i] * exp_refreshes
         sigma = math.sqrt(max(var, 0.0)) * cfg["sigma_scale"]
         sigma += cfg["thin_sigma"] / (1.0 + n_trans[i])
+        if disagree > 0.0:
+            sigma += cfg["dec_disagree_w"] * disagree * (1.0 - dec[1][i])
         sigma *= 1.0 + 0.12 * stale_days
         if last_rate[i] <= 0.05 or last_rate[i] >= 99.9:
             sigma *= 1.20
         elif last_rate[i] <= 0.5:
             sigma *= 1.10
+        if len(segments) <= cfg["young_floor_segs"] and hours_cp < cfg["young_floor_hours"]:
+            floor = clamp(cfg["young_floor_c0"] - cfg["young_floor_c1"] * max(hours_cp, 0.0),
+                          cfg["young_floor_min"], cfg["young_floor_c0"])
+            sigma = max(sigma, floor)
         sigma = clamp(sigma, cfg["sigma_min"], cfg["sigma_max"])
         sigma_dn = sigma_up = sigma
         if drift[i] < -0.05:
